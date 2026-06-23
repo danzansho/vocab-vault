@@ -1,6 +1,6 @@
-venv/
 .env
-*.ogg
-*.db
 bot.log
+vocab.db
+*.ogg
 __pycache__/
+venv/

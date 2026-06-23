@@ -1,6 +1,10 @@
 import asyncio
+import json
 import os
-import datetime
+import re
+import logging
+from datetime import datetime, timedelta, timezone
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.state import StatesGroup, State
@@ -10,11 +14,9 @@ from aiogram.types import BotCommand, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from groq import Groq
 
-# Import database module
 import database
 
 # Configure logging
-import logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -28,17 +30,22 @@ logging.basicConfig(
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-INBOX_PATH = os.getenv("INBOX_PATH")
+INBOX_PATH = os.getenv("INBOX_PATH")  # fallback if no DB path
+
+if not BOT_TOKEN or not GROQ_API_KEY:
+    raise RuntimeError("BOT_TOKEN and GROQ_API_KEY are required")
 
 # Initialize Bot, Dispatcher and Groq Client
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 dp = Dispatcher()
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# Define FSM States
+
+# --- FSM STATES ---
 class VocabStates(StatesGroup):
     waiting_for_path = State()
     quiz_active = State()
+
 
 # --- SUPERMEMO-2 (SM-2) ALGORITHM ---
 def calculate_sm2(q: int, prev_interval: int, prev_ef: float, prev_repetitions: int):
@@ -48,20 +55,40 @@ def calculate_sm2(q: int, prev_interval: int, prev_ef: float, prev_repetitions: 
         elif prev_repetitions == 1:
             new_interval = 6
         else:
-            new_interval = int(prev_interval * prev_ef)
+            new_interval = int(round(prev_interval * prev_ef))
         new_repetitions = prev_repetitions + 1
     else:
         new_interval = 1
         new_repetitions = 0
 
     new_ef = prev_ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02))
-    if new_ef < 1.3:
-        new_ef = 1.3
+    new_ef = max(1.3, new_ef)
 
     return new_interval, new_ef, new_repetitions
 
 
-# Handler for /start
+# --- HELPERS ---
+def safe_filename(word: str) -> str:
+    """Remove unsafe characters and prevent directory traversal."""
+    cleaned = re.sub(r"[^\w\s-]", "", word).strip().replace(" ", "_")
+    return (cleaned[:50] or "word") + ".md"
+
+
+def now_date() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def get_inbox_path(user_id: int) -> str | None:
+    """Return user path from DB or fallback from env."""
+    user_path = await database.get_user_path(user_id)
+    if user_path and os.path.isdir(user_path):
+        return user_path
+    if INBOX_PATH and os.path.isdir(INBOX_PATH):
+        return INBOX_PATH
+    return None
+
+
+# --- HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -73,18 +100,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
             f"👋 *Welcome back, {message.from_user.first_name}!*\n"
             f"───────────────────────\n"
             f"📂 *Your Obsidian Path:*\n`{user_path}`\n\n"
-            f"Ready to learn? Send me a new word (text or voice), or run /quiz to review!"
+            f"Send me a new word (text or voice), or run /quiz to review!"
         )
     else:
         await message.answer(
             f"👋 *Hello, {message.from_user.first_name}!*\n"
             f"───────────────────────\n"
             f"I am your automated English Vocab assistant.\n\n"
-            f"Please send me the *absolute path* to your Obsidian `1 - Inbox` folder on your computer."
+            f"Please send me the *absolute path* to your Obsidian `1 - Inbox` folder."
         )
         await state.set_state(VocabStates.waiting_for_path)
 
-# Handler to capture Obsidian path
+
 @dp.message(VocabStates.waiting_for_path)
 async def process_path(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -100,7 +127,6 @@ async def process_path(message: types.Message, state: FSMContext):
     await state.clear()
 
 
-# Handler for /stats command
 @dp.message(Command(commands=["stats"]))
 async def cmd_stats(message: types.Message):
     user_id = message.from_user.id
@@ -110,77 +136,87 @@ async def cmd_stats(message: types.Message):
     await message.answer(
         f"📊 *Your Vocabulary Stats:*\n"
         f"───────────────────────\n"
-        f"📚 *Total words in database:* `{stats['total']}`\n"
-        f"⏳ *Words scheduled for today:* `{stats['to_review']}`\n\n"
+        f"📚 *Total words:* `{stats['total']}`\n"
+        f"⏳ *Words to review:* `{stats['to_review']}`\n\n"
         f"💡 Use /quiz to start your review session!"
     )
 
 
-# --- VOCABULARY CAPTURE LOGIC ---
+# --- VOCABULARY CAPTURE ---
 async def process_new_word(user_id: int, raw_input: str, is_voice: bool = False):
-    inbox_path = await database.get_user_path(user_id)
+    inbox_path = await get_inbox_path(user_id)
     if not inbox_path:
         return "❌ Please run /start to configure your Obsidian path first."
 
-    # Updated prompt to strictly output EXAMPLE in the metadata block
     prompt = f"""
-    You are an English teacher assistant.
-    The user sent you this raw input: "{raw_input}"
+You are an English vocabulary assistant. The user sent: "{raw_input}".
 
-    Do the following:
-    1. Extract the main English word.
-    2. Provide its Russian translation.
-    3. Generate a short, elegant example sentence in English with Russian translation in brackets.
-    4. Generate a clean Markdown note for Obsidian.
+Identify the main English word. If the input is in Russian, translate it to English first.
+Return ONLY a valid JSON object with exactly these keys:
+- "word": the English word
+- "translation": Russian translation
+- "example": a short English example sentence with Russian translation in brackets
 
-    You MUST format your output strictly like this (use three hyphens --- as a separator):
-    WORD: [english_word]
-    TRANSLATION: [russian_translation]
-    EXAMPLE: [example_sentence]
-    ---
-    # [english_word]
-    #vocabulary #english
+Example output:
+{{"word": "friction", "translation": "трение", "example": "There was some friction between the team members. [Между членами команды возникло некоторое трение.]"}}
+"""
 
-    - **Translation:** [russian_translation]
-    - **Context/Example:** [example_sentence]
-    """
-
-    completion = groq_client.chat.completions.create(
-        messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
-    )
-
-    response_text = completion.choices[0].message.content
     try:
-        parts = response_text.split("---")
-        meta = parts[0].strip().split("\n")
-        markdown_note = parts[1].strip()
+        completion = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
 
-        extracted_word = meta[0].replace("WORD:", "").strip().lower()
-        extracted_translation = meta[1].replace("TRANSLATION:", "").strip().lower()
-        extracted_example = meta[2].replace("EXAMPLE:", "").strip()
+        data = json.loads(completion.choices[0].message.content)
+        word = data["word"].strip().lower()
+        translation = data["translation"].strip()
+        example = data["example"].strip()
 
-        # Save word, translation AND example to the SQLite database
-        await database.add_word(user_id, extracted_word, extracted_translation, extracted_example)
+        if not word or not translation:
+            raise ValueError("LLM returned empty word or translation")
 
-        filename = f"{extracted_word}.md"
+        # Check for duplicate before saving
+        existing = await database.find_word(user_id, word)
+        if existing:
+            return (
+                f"⚠️ Word `{existing['word']}` already exists in your library.\n"
+                f"🇷🇺 {existing['translation']}\n"
+                f"💡 _{existing['example']}_"
+            )
+
+        # Save to database
+        await database.add_word(user_id, word, translation, example)
+
+        # Save Markdown note to Obsidian
+        markdown_note = (
+            f"# {word}\n"
+            f"#vocabulary #english\n\n"
+            f"- **Translation:** {translation}\n"
+            f"- **Context/Example:** {example}\n"
+        )
+        filename = safe_filename(word)
         full_path = os.path.join(inbox_path, filename)
+
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(markdown_note)
 
-        logging.info(f"Word '{extracted_word}' saved to database and Obsidian for user {user_id}")
+        logging.info(f"Word '{word}' saved for user {user_id}")
 
         return (
             f"✅ *Word Saved!*\n"
             f"───────────────────────\n"
-            f"📝 *Word:* `{extracted_word}`\n"
-            f"🇷🇺 *Translation:* {extracted_translation}\n"
-            f"💡 *Example:* _{extracted_example}_\n\n"
-            f"Added to your Obsidian inbox and active review queue!"
+            f"📝 *Word:* `{word}`\n"
+            f"🇷🇺 *Translation:* {translation}\n"
+            f"💡 *Example:* _{example}_\n\n"
+            f"Added to your Obsidian inbox and review queue!"
         )
+
     except Exception as e:
-        logging.error(f"Error parsing AI response: {e}")
-        return f"❌ Failed to parse AI response. Raw output:\n\n{response_text}"
+        logging.error(f"Error processing word for user {user_id}: {e}")
+        return "❌ Failed to process the word. Please try again with clearer input."
+
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text_capture(message: types.Message):
@@ -189,46 +225,39 @@ async def handle_text_capture(message: types.Message):
     result = await process_new_word(user_id, message.text)
     await msg.edit_text(result)
 
+
 @dp.message(F.voice)
 async def handle_voice_capture(message: types.Message):
     user_id = message.from_user.id
     msg = await message.answer("⏳ Downloading audio...")
-    destination = "temp_voice.ogg"
+
+    # Unique temp file per user & message to avoid race conditions
+    temp_file = f"temp_voice_{user_id}_{message.message_id}.ogg"
 
     try:
-        file_id = message.voice.file_id
-        file = await bot.get_file(file_id)
-        await bot.download_file(file.file_path, destination)
+        file = await bot.get_file(message.voice.file_id)
+        await bot.download_file(file.file_path, temp_file)
 
         await msg.edit_text("🎧 Transcribing...")
-        with open(destination, "rb") as audio_file:
+        with open(temp_file, "rb") as audio_file:
             transcription = groq_client.audio.transcriptions.create(
-              file=(destination, audio_file.read()),
-              model="whisper-large-v3",
+                file=(temp_file, audio_file.read()),
+                model="whisper-large-v3",
             )
-        raw_text = transcription.text
 
         await msg.edit_text("🧠 Analyzing and saving...")
-        result = await process_new_word(user_id, raw_text, is_voice=True)
+        result = await process_new_word(user_id, transcription.text, is_voice=True)
         await msg.edit_text(result)
 
     except Exception as e:
-        logging.error(f"Voice processing error: {e}")
-        await msg.edit_text(f"❌ Error: {e}")
+        logging.error(f"Voice processing error for user {user_id}: {e}")
+        await msg.edit_text("❌ Could not process voice message. Please try text.")
     finally:
-        if os.path.exists(destination):
-            os.remove(destination)
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
 
 
-# --- INTERACTIVE QUIZ (SM-2) LOGIC ---
-class QuizSession:
-    def __init__(self, words_list):
-        self.words = words_list
-        self.current_index = 0
-
-active_quizzes = {}
-
-# Start a review session
+# --- INTERACTIVE QUIZ (FSM) ---
 @dp.message(Command(commands=["quiz"]))
 async def cmd_quiz(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -238,109 +267,103 @@ async def cmd_quiz(message: types.Message, state: FSMContext):
         await message.answer("🎉 *Excellent!* No words to review today. You are completely caught up!")
         return
 
-    active_quizzes[user_id] = QuizSession(words_to_review)
     await state.set_state(VocabStates.quiz_active)
-    await ask_next_word(message, user_id)
+    await state.update_data(words=words_to_review, index=0)
+    await ask_next_word(user_id, state)
 
-async def ask_next_word(message: types.Message, user_id: int):
-    session = active_quizzes.get(user_id)
-    if not session or session.current_index >= len(session.words):
-        await bot.send_message(
-            chat_id=user_id,
-            text="🏁 *Quiz Completed!* Great job. All scheduled words reviewed."
-        )
-        active_quizzes.pop(user_id, None)
+
+async def ask_next_word(user_id: int, state: FSMContext):
+    data = await state.get_data()
+    words = data.get("words", [])
+    index = data.get("index", 0)
+
+    if index >= len(words):
+        await bot.send_message(chat_id=user_id, text="🏁 *Quiz completed!* Great job.")
+        await state.clear()
         return
 
-    current_item = session.words[session.current_index]
-    total_words = len(session.words)
-    current_num = session.current_index + 1
-
+    current = words[index]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👁 Show Translation", callback_data=f"reveal_{current_item['word_id']}")]
+        [InlineKeyboardButton(text="👁 Show Translation", callback_data="reveal")]
     ])
 
-    # Clean and structured question card
     await bot.send_message(
         chat_id=user_id,
-        text=f"📊 *Word {current_num} of {total_words}*\n"
+        text=f"📊 *Word {index + 1} of {len(words)}*\n"
              f"───────────────────────\n"
              f"How do you translate this word?\n\n"
-             f"👉 *{current_item['word'].upper()}*",
+             f"👉 *{current['word'].upper()}*",
         reply_markup=keyboard
     )
 
-@dp.callback_query(F.data.startswith("reveal_"))
-async def process_reveal(callback: types.CallbackQuery):
-    word_id = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-    session = active_quizzes.get(user_id)
 
-    if not session:
+@dp.callback_query(F.data == "reveal")
+async def process_reveal(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    words = data.get("words", [])
+    index = data.get("index", 0)
+
+    if not words or index >= len(words):
         await callback.answer("Session expired.")
         return
 
-    current_item = session.words[session.current_index]
-    total_words = len(session.words)
-    current_num = session.current_index + 1
-
+    current = words[index]
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="0️⃣ (Forgot)", callback_data=f"grade_0_{word_id}"),
-            InlineKeyboardButton(text="1️⃣", callback_data=f"grade_1_{word_id}"),
-            InlineKeyboardButton(text="2️⃣", callback_data=f"grade_2_{word_id}")
+            InlineKeyboardButton(text="0️⃣", callback_data="grade_0"),
+            InlineKeyboardButton(text="1️⃣", callback_data="grade_1"),
+            InlineKeyboardButton(text="2️⃣", callback_data="grade_2"),
         ],
         [
-            InlineKeyboardButton(text="3️⃣", callback_data=f"grade_3_{word_id}"),
-            InlineKeyboardButton(text="4️⃣", callback_data=f"grade_4_{word_id}"),
-            InlineKeyboardButton(text="5️⃣ (Perfect)", callback_data=f"grade_5_{word_id}")
+            InlineKeyboardButton(text="3️⃣", callback_data="grade_3"),
+            InlineKeyboardButton(text="4️⃣", callback_data="grade_4"),
+            InlineKeyboardButton(text="5️⃣", callback_data="grade_5"),
         ]
     ])
 
-    # Premium-looking reveal card with example sentence!
     await callback.message.edit_text(
-        text=f"📊 *Word {current_num} of {total_words}*\n"
+        text=f"📊 *Word {index + 1} of {len(words)}*\n"
              f"───────────────────────\n"
-             f"📝 *Word:* ` {current_item['word'].upper()} `\n"
-             f"🇷🇺 *Translation:* *{current_item['translation'].upper()}*\n\n"
-             f"💡 *Context:* _{current_item['example']}_\n"
+             f"📝 *Word:* `{current['word'].upper()}`\n"
+             f"🇷🇺 *Translation:* {current['translation'].upper()}\n\n"
+             f"💡 *Context:* _{current['example']}_\n"
              f"───────────────────────\n"
-             f"Rate how well you remembered it (0 = forgot, 5 = instant):",
+             f"Rate how well you remembered it (0 = forgot, 5 = perfect):",
         reply_markup=keyboard
     )
     await callback.answer()
 
+
 @dp.callback_query(F.data.startswith("grade_"))
 async def process_grade(callback: types.CallbackQuery, state: FSMContext):
-    data_parts = callback.data.split("_")
-    grade = int(data_parts[1])
-    word_id = int(data_parts[2])
-    user_id = callback.from_user.id
-    session = active_quizzes.get(user_id)
+    grade = int(callback.data.split("_")[1])
+    data = await state.get_data()
+    words = data.get("words", [])
+    index = data.get("index", 0)
 
-    if not session:
+    if not words or index >= len(words):
         await callback.answer("Session expired.")
         return
 
-    current_item = session.words[session.current_index]
-
+    current = words[index]
     new_interval, new_ef, new_rep = calculate_sm2(
         grade,
-        current_item["interval"],
-        current_item["ease_factor"],
-        current_item["repetitions"]
+        current["interval"],
+        current["ease_factor"],
+        current["repetitions"]
     )
 
-    next_date = (datetime.datetime.now() + datetime.timedelta(days=new_interval)).strftime("%Y-%m-%d")
-    await database.update_word_progress(word_id, new_interval, new_ef, new_rep, next_date)
+    next_date = (datetime.now(timezone.utc) + timedelta(days=new_interval)).strftime("%Y-%m-%d")
+    await database.update_word_progress(current["word_id"], new_interval, new_ef, new_rep, next_date)
 
-    logging.info(f"Updated word {word_id} for user {user_id}. Next review: {next_date}, interval: {new_interval}")
+    logging.info(f"Updated word {current['word_id']} for user {callback.from_user.id}. Next: {next_date}")
 
-    session.current_index += 1
+    await state.update_data(index=index + 1)
     await callback.message.delete()
-    await callback.answer(f"Recorded! Grade: {grade}")
+    await callback.answer(f"Recorded: {grade}")
 
-    await ask_next_word(callback.message, user_id)
+    await ask_next_word(callback.from_user.id, state)
+
 
 async def main():
     await database.init_db()
@@ -351,6 +374,7 @@ async def main():
     ])
     logging.info("Database initialized. Vocab Bot is running...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
