@@ -1,0 +1,5 @@
+venv/
+.env
+*.ogg
+*.db
+bot.log
