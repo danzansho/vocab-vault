@@ -1,4 +1,4 @@
-# Obsidian Vocabulary Builder Bot 🎙📚
+# VocabVault 🎙📚
 
 An intelligent Telegram bot that helps you capture and master English vocabulary using the **SuperMemo-2 (SM-2)** spaced repetition algorithm.
 
