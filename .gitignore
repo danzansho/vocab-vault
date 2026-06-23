@@ -3,3 +3,4 @@ venv/
 *.ogg
 *.db
 bot.log
+__pycache__/
